@@ -1,113 +1,83 @@
-use crate::data_structs;
-use crate::errors::server::ServerError;
-use actix_web::{
-    cookie::{time::Duration, Cookie},
-    web, HttpRequest, HttpResponse, Responder,
-};
-use aws_sdk_cognitoidentityprovider::config::{Credentials, Region};
-use base64::{engine::general_purpose, Engine};
+use crate::operations::auth::AuthCredentials;
+use crate::operations::user::{UserAuthCredentials, UserLoginRequest};
+use crate::operations::user_token::UserToken;
+use crate::{errors::server::ServerError, operations::auth::AuthClient};
+use actix_web::{web, HttpRequest, HttpResponse};
 use dotenv::dotenv;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use std::{
-    collections::HashMap,
-    env::{self},
-};
-type HmacSha256 = Hmac<Sha256>;
-
-// pub async fn register_user_handler(
-//     client: web::Data<Client>,
-// ) -> Result<impl Responder, ServerError> {
-// }
+use jsonwebtokens_cognito::KeySet;
+use std::env::{self};
 
 pub async fn login_user_handler(
-    _req: HttpRequest,
-    params: web::Form<data_structs::UserLoginRequest>,
-) -> Result<impl Responder, ServerError> {
+    req: HttpRequest,
+    params: web::Form<UserLoginRequest>,
+) -> Result<HttpResponse, ServerError> {
+    // gather variables
     dotenv().ok();
-    let secret: String = env::var("COGNITO_SECRET").unwrap_or("".into());
-    let client_id: String = env::var("APP_CLIENT_ID").unwrap_or("".into());
-    let user_pool_id: String = env::var("USER_POOL_ID").unwrap_or("".into());
-    let auth_flow = "ADMIN_USER_PASSWORD_AUTH".into();
-    // let region = env::var("COGNITO_REGION").unwrap_or("".into());
-    // let access_key_id = env::var("AWS_ACCESS_KEY_ID").unwrap_or("".into());
-    // let secret_access_key = env::var("AWS_SECRET_ACCESS_KEY").unwrap_or("".into());
-
     let config = aws_config::load_from_env().await;
-    // .region(Region::new(region))
-    // .credentials_provider(Credentials::new(
-    //     access_key_id,
-    //     secret_access_key,
-    //     Some("WebIdentityToken".into()),
-    //     None,
-    //     "Environment",
-    // ))
-    // .load()
-    // .await;
-    // println!("{:?}", client_id);
 
-    let updater: String = format!("{}{}", params.email, client_id);
+    let secret: Option<String> = env::var("COGNITO_SECRET").ok();
+    let client_id: Option<String> = env::var("APP_CLIENT_ID").ok();
+    let user_pool_id: Option<String> = env::var("USER_POOL_ID").ok();
 
-    let mut hash: HmacSha256 = HmacSha256::new_from_slice(secret.as_bytes())?;
-    hash.update(updater.as_bytes());
+    // println!("{:?}\n{:?}\n{:?}\n", secret, client_id, user_pool_id);
 
-    let encoded_key = general_purpose::STANDARD.encode(hash.finalize().into_bytes());
+    let mut credentials = AuthCredentials::prepare(
+        secret.clone(),
+        client_id.clone(),
+        user_pool_id.clone(),
+        "ADMIN_USER_PASSWORD_AUTH",
+    );
 
-    let client = aws_sdk_cognitoidentityprovider::Client::new(&config)
-        .admin_initiate_auth()
-        .set_user_pool_id(Some(user_pool_id))
-        .set_client_id(Some(client_id))
-        .auth_flow(auth_flow);
+    credentials.set_hash();
+    let updater = format!("{}{}", params.email, client_id.clone().unwrap());
+    credentials.update_hash(updater.as_bytes());
+    credentials.set_encoding();
 
-    let credentials: HashMap<String, String> = HashMap::from([
-        ("USERNAME".into(), params.email.clone()),
-        ("PASSWORD".into(), params.password.clone()),
-        ("SECRET_HASH".into(), encoded_key),
-    ]);
+    let mut auth_output = AuthClient::new(credentials, &config);
+    auth_output.prepare();
 
-    let auth_output = client.set_auth_parameters(Some(credentials)).send().await;
-    // println!("{:?}", auth_output);
-    let auth_output = auth_output?;
+    let user_credentials = params.package_data();
 
-    let authentication_result = auth_output.authentication_result().unwrap();
+    let authentication_result = auth_output.auth(user_credentials).await;
 
-    // println!("{:?}", authentication_result);
+    let authentication_result: aws_sdk_cognitoidentityprovider::types::AuthenticationResultType =
+        authentication_result?.clone();
 
-    let refresh_cookie = Cookie::build(
-        "refresh_token",
-        authentication_result.refresh_token().unwrap(),
-    )
-    .max_age(Duration::minutes(authentication_result.expires_in().into()))
-    .same_site(actix_web::cookie::SameSite::Lax)
-    .path("/")
-    .domain("localhost")
-    .finish();
+    let mut user_login_res =
+        UserAuthCredentials::build(authentication_result, req.headers().get("host").cloned());
 
-    let access_cookie = Cookie::build(
-        "access_token",
-        authentication_result.access_token().unwrap(),
-    )
-    .max_age(Duration::minutes(authentication_result.expires_in().into()))
-    .same_site(actix_web::cookie::SameSite::Lax)
-    .path("/")
-    .domain("localhost")
-    .finish();
+    user_login_res.cookify();
 
-    let id_cookie = Cookie::build("id_token", authentication_result.id_token().unwrap())
-        .max_age(Duration::minutes(authentication_result.expires_in().into()))
-        .same_site(actix_web::cookie::SameSite::Lax)
-        .path("/")
-        .domain("localhost")
-        .finish();
+    let res = user_login_res.response();
+    println!("Res: {:?}", res);
 
-    let mut res = HttpResponse::Ok().body("Logged in");
+    res
+}
 
-    res.add_cookie(&refresh_cookie)?;
-    res.add_cookie(&access_cookie)?;
-    res.add_cookie(&id_cookie)?;
-    // println!("{:?}", res);
+pub async fn authorize_user_handler(req: HttpRequest) -> Result<HttpResponse, ServerError> {
+    let client_id: Option<String> = env::var("APP_CLIENT_ID").ok();
+
+    let user_auth_credentials: UserAuthCredentials = req.into();
+    let access_token = user_auth_credentials.tokens.get("access_token");
+    if let Some(UserToken::Cookie(token)) = access_token {
+        if let (Some(region), Some(user_pool_id)) = (
+            env::var("COGNITO_REGION").ok(),
+            env::var("USER_POOL_ID").ok(),
+        ) {
+            let keyset = KeySet::new(region, user_pool_id)?;
+            keyset.prefetch_jwks().await?;
+
+            let verifier = keyset
+                .new_access_token_verifier(&[&client_id.unwrap()])
+                .build()?;
+
+            let foo = keyset.verify(&token.value(), &verifier).await?;
+
+            println!("{:?}", foo);
+        }
+    }
+
+    let res = HttpResponse::Unauthorized().finish();
 
     Ok(res)
 }
-
-// pub async fn auth_user_handler(client: web::Data<Client>) -> Result<impl Responder, ServerError> {}

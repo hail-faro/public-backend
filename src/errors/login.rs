@@ -7,8 +7,19 @@ use jsonwebtokens::error::Error as JwtError;
 use jsonwebtokens_cognito::Error as JwksError;
 use std::env::VarError;
 use std::error::Error;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct SecretHashError;
+
+impl Display for SecretHashError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.write_str("Missing SECRET_HASH")
+    }
+}
+
+impl Err for SecretHashError {}
 
 #[derive(Debug)]
 pub enum LoginError<E: Error> {
@@ -18,6 +29,7 @@ pub enum LoginError<E: Error> {
     HttpError(HttpError),
     JwksError(JwksError),
     JwtError(JwtError),
+    SecretHashError(SecretHashError),
 }
 
 impl<E: Error> Err for LoginError<E> {}

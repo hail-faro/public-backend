@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  backend:
+    build: .
+    image: zwalt734/backend
+    ports:
+      - "3000:3000"
+    volumes:
+      - "~/.aws:/root/.aws"
